@@ -203,6 +203,8 @@ class VerifiersEnv(BaseEnv):
             "ref_logprobs": None,
             "generation_params": None,
             "images": None,
+            "distill_token_ids": None,  
+            "distill_logprobs": None,
         }
 
         for state in states:
@@ -297,7 +299,7 @@ class VerifiersEnv(BaseEnv):
 
             full_ids.extend(new_prompt_ids)
             full_mask.extend([-100] * len(new_prompt_ids))  # Always mask prompt/env
-            full_logprobs.extend([0.0] * len(new_prompt_ids))
+            full_logprobs.extend([1.0] * len(new_prompt_ids))
 
             # --- 2. Handle Completion (Assistant) ---
             full_ids.extend(c_ids)
@@ -358,7 +360,7 @@ class VerifiersEnv(BaseEnv):
             full_mask = [-100] * len(full_ids)
 
         # Dummy logprobs for OpenAI (we don't have them)
-        full_logprobs = [0.0] * len(full_ids)
+        full_logprobs = [1.0] * len(full_ids)
 
         return list(full_ids), full_mask, full_logprobs
 

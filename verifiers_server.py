@@ -30,6 +30,7 @@ from atroposlib.envs.base import (
     ScoredDataGroup,
 )
 from atroposlib.type_definitions import Item
+from atroposlib.envs.server_handling.managed_server import ManagedServerAdapter
 
 # Ensure logs are visible
 logging.basicConfig(level=logging.INFO)
@@ -180,15 +181,15 @@ class VerifiersEnv(BaseEnv):
             info=item.get("info", {}),
         )
 
-    def _states_to_scored_data(self, states: List[State]) -> Optional[ScoredDataGroup]:
+    def _build_scored_data(
+        self, states: List[State], tracked_nodes: List[Any]
+    ) -> Optional[ScoredDataGroup]:
         """
-        Convert verifiers States to Atropos ScoredDataGroup.
-
-        Handles both:
-        - vLLM backend: native tokens from trajectory
-        - OpenAI backend: post-hoc tokenization with chat template
+        Merge verifiers rewards with ManagedServer perfectly aligned tokens.
+        Matches concurrent rollout states to their respective ManagedServer nodes
+        to prevent alignment bugs caused by asynchronous generation completion.
         """
-        if not states:
+        if not states or not tracked_nodes:
             return None
 
         scored_data: ScoredDataGroup = {
@@ -203,228 +204,118 @@ class VerifiersEnv(BaseEnv):
             "ref_logprobs": None,
             "generation_params": None,
             "images": None,
-            "distill_token_ids": None,  
+            "distill_token_ids": None,
             "distill_logprobs": None,
         }
 
+        # Keep track of which nodes we haven't matched yet
+        unmatched_nodes = list(tracked_nodes)
+
         for state in states:
-            # Skip failed rollouts
             if state.get("error") is not None:
-                logger.warning(f"Skipping failed rollout: {ErrorChain(state['error'])}")
                 continue
 
-            # Check if vLLM provided native tokens
-            trajectory = state.get("trajectory", [])
-            has_native_tokens = len(trajectory) > 0 and all(
-                step.get("tokens") is not None for step in trajectory
-            )
-
-            if has_native_tokens:
-                # vLLM case: stitch native tokens from trajectory
-                full_ids, full_mask, full_logprobs = self._stitch_trajectory_tokens(
-                    state
-                )
-            else:
-                # OpenAI case: post-hoc tokenize with chat template
-                full_ids, full_mask, full_logprobs = self._tokenize_from_messages(state)
-
-            # Build full messages for logging
-            prompt = state.get("prompt", [])
             completion = state.get("completion", [])
-            full_messages = (
-                prompt + completion if isinstance(completion, list) else prompt
-            )
+            if not completion:
+                continue
 
-            scored_data["tokens"].append(full_ids)
-            scored_data["masks"].append(full_mask)
+            # Verifiers sometimes uses a single dict or a list for completion
+            if isinstance(completion, dict):
+                completion = [completion]
+
+            # Get the exact text the model generated in this rollout
+            final_content = completion[-1].get("content", "")
+
+            # Match the verifiers state to the ManagedServer node by content suffix
+            matched_node = None
+            for node in unmatched_nodes:
+                if node.full_text.endswith(final_content):
+                    matched_node = node
+                    break
+
+            if matched_node is None:
+                logger.warning(
+                    "Could not find matching ManagedServer node for verifiers state. Skipping."
+                )
+                continue
+
+            # Remove it so we don't accidentally match it twice
+            unmatched_nodes.remove(matched_node)
+
+            # --- Now we can safely merge them! ---
 
             reward = state.get("reward", 0.0)
-
-            # Capture metrics for WandB logging
             self.reward_buffer.append(reward)
 
-            # Verifiers states often contain a breakdown of metrics (e.g. strict accuracy vs partial)
             state_metrics = state.get("metrics", {})
             if state_metrics:
                 for k, v in state_metrics.items():
                     if isinstance(v, (int, float)):
                         self.metrics_buffer[k].append(v)
 
+            prompt = state.get("prompt", [])
+            full_messages = prompt + completion
+
+            # Data from ManagedServer (Perfectly aligned tokens/masks/logprobs)
+            scored_data["tokens"].append(matched_node.tokens)
+            scored_data["masks"].append(matched_node.masked_tokens)
+            scored_data["inference_logprobs"].append(matched_node.logprobs)
+
+            # Data from Verifiers (Rewards, metrics, messages)
             scored_data["scores"].append(reward)
             scored_data["messages"].append(full_messages)
-            scored_data["inference_logprobs"].append(full_logprobs)
             scored_data["overrides"].append({})
 
-        # Return None if all rollouts failed
         if not scored_data["tokens"]:
             return None
 
         return scored_data
 
-    def _stitch_trajectory_tokens(
-        self, state: State
-    ) -> Tuple[List[int], List[int], List[float]]:
-        """
-        Stitch tokens from all trajectory steps (vLLM case).
-
-        For multi-turn: concatenates all steps, masking non-assistant tokens.
-        """
-        trajectory = state.get("trajectory", [])
-        if not trajectory:
-            return [], [], []
-
-        full_ids = []
-        full_mask = []
-        full_logprobs = []
-
-        # Track the length of the sequence we have built so far to find the "diff"
-        # in the prompt tokens for subsequent turns.
-        current_len = 0
-
-        for i, step in enumerate(trajectory):
-            tokens_data = step.get("tokens")
-            if not tokens_data:
-                # If any step is missing tokens, abort this vLLM-specific stitching
-                # and fall back to the generic tokenizer method.
-                return [], [], []
-
-            p_ids = tokens_data.get("prompt_ids", [])
-            c_ids = tokens_data.get("completion_ids", [])
-            c_logprobs = tokens_data.get("completion_logprobs", [])
-
-            # --- 1. Handle Prompt (User/Env) ---
-            # For step 0, take the whole prompt.
-            # For step > 0, p_ids includes the entire history.
-            new_prompt_ids = p_ids[current_len:]
-
-            full_ids.extend(new_prompt_ids)
-            full_mask.extend([-100] * len(new_prompt_ids))  # Always mask prompt/env
-            full_logprobs.extend([1.0] * len(new_prompt_ids))
-
-            # --- 2. Handle Completion (Assistant) ---
-            full_ids.extend(c_ids)
-            full_mask.extend(c_ids)  # Unmasked: use IDs as labels
-            full_logprobs.extend(c_logprobs)
-
-            # Update current length for next iteration
-            current_len = len(p_ids) + len(c_ids)
-
-        return full_ids, full_mask, full_logprobs
-
-    def _tokenize_from_messages(
-        self, state: State
-    ) -> Tuple[List[int], List[int], List[float]]:
-        """
-        Post-hoc tokenize from message content (OpenAI case).
-
-        Uses chat template to ensure proper formatting.
-        """
-        prompt = state.get("prompt", [])
-        completion = state.get("completion", [])
-
-        if not prompt:
-            return [], [], []
-
-        # Full conversation
-        full_messages = prompt + completion if isinstance(completion, list) else prompt
-
-        # Tokenize full conversation with chat template
-        try:
-            full_ids = self.tokenizer.apply_chat_template(
-                full_messages,
-                tokenize=True,
-                add_generation_prompt=False,
-            )
-        except Exception as e:
-            logger.error(f"Failed to tokenize messages: {e}")
-            return [], [], []
-
-        # Tokenize just the prompt to find the boundary
-        try:
-            prompt_ids = self.tokenizer.apply_chat_template(
-                prompt,
-                tokenize=True,
-                add_generation_prompt=True,  # Include generation prompt marker
-            )
-        except Exception as e:
-            logger.error(f"Failed to tokenize prompt: {e}")
-            prompt_ids = []
-
-        prompt_len = len(prompt_ids)
-
-        # Build mask: -100 for prompt, token IDs for completion
-        if prompt_len < len(full_ids):
-            full_mask = [-100] * prompt_len + list(full_ids[prompt_len:])
-        else:
-            # Edge case: completion is empty
-            full_mask = [-100] * len(full_ids)
-
-        # Dummy logprobs for OpenAI (we don't have them)
-        full_logprobs = [1.0] * len(full_ids)
-
-        return list(full_ids), full_mask, full_logprobs
-
     async def collect_trajectories(
         self, item: Item
     ) -> Tuple[Optional[ScoredDataGroup], List[Item]]:
-        """
-        Generate and score trajectories using verifiers' native rollout.
-
-        Delegates to vf_env.run_group which handles:
-        - Multi-turn loops
-        - Stop conditions
-        - State tracking
-        - Scoring
-        """
         if self._vf_client is None:
             await self.setup()
 
-        if self._vf_client is None:
-            logger.error("Failed to initialize AsyncOpenAI client")
-            return None, []
-
-        # Prepare inputs for verifiers (one per group member)
         rollout_inputs = [
             self._item_to_rollout_input(item, example_id=i)
             for i in range(self.config.group_size)
         ]
 
-        # Sampling args for generation
         sampling_args = {
             "max_tokens": self.config.max_token_length,
-            "logprobs": True,
-            "extra_body": {"return_token_ids": True},
+            "temperature": self.config.eval_temperature or 1.0,
         }
-        if self.config.eval_temperature is not None:
-            sampling_args["temperature"] = self.config.eval_temperature
-        else:
-            sampling_args["temperature"] = 1.0  # Default for training
 
-        # Get model name
-        model_name = "default"
-        if self.server and self.server.servers:
-            model_name = self.server.servers[0].config.model_name
-
-        try:
-            # Delegate to verifiers' native run_group
-            gen_sem = asyncio.Semaphore(self.config.group_size)
-            score_sem = asyncio.Semaphore(100)
-
-            states = await self.vf_env.run_group(
-                group_inputs=rollout_inputs,
-                client=self._vf_client,
-                model=model_name,
-                gen_sampling_args=sampling_args,
-                gen_sem=gen_sem,
-                score_sem=score_sem,
-                score=True,
+        # 1. Atropos automatically finds the least-busy GPU in the cluster
+        async with self.server.managed_server(tokenizer=self.tokenizer) as managed:
+            # 2. Create the dummy OpenAI client for Verifiers
+            adapter_client = ManagedServerAdapter(
+                managed, base_url=managed.server.config.base_url
             )
-        except Exception as e:
-            logger.error(f"Error during verifiers rollout: {e}")
-            return None, []
 
-        # Convert states to ScoredDataGroup
-        scored_data = self._states_to_scored_data(list(states))
+            try:
+                # 3. Verifiers runs its multi-turn logic using the adapter
+                states = await self.vf_env.run_group(
+                    group_inputs=rollout_inputs,
+                    client=adapter_client,
+                    model="default",
+                    gen_sampling_args=sampling_args,
+                    gen_sem=asyncio.Semaphore(self.config.group_size),
+                    score_sem=asyncio.Semaphore(100),
+                    score=True,
+                )
+            except Exception as e:
+                logger.error(f"Error during verifiers rollout: {e}")
+                return None, []
+
+            # 4. Atropos has been secretly tracking the perfectly aligned tokens/logprobs!
+            tracked_nodes = managed.get_state()["nodes"]
+
+        # 5. Zip them together.
+        # Grab the 'reward' from the Verifiers state, and the tokens/masks/logprobs from the Atropos node.
+        scored_data = self._build_scored_data(list(states), tracked_nodes)
+
         return scored_data, []
 
     async def evaluate(self, *args, **kwargs):

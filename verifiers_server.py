@@ -5,7 +5,6 @@ Enables Verifiers environments to be used for Atropos Evaluation, Data Generatio
 Uses verifiers' native rollout for correct multi-turn support and token capture.
 """
 
-import asyncio
 import json
 import logging
 import random
@@ -19,9 +18,7 @@ import httpx
 import verifiers as vf
 from openai import AsyncOpenAI
 from pydantic import Field, Json
-from verifiers.types import RolloutInput, State
-from verifiers.utils.error_utils import ErrorChain
-from verifiers.utils.message_utils import messages_to_printable, sanitize_tool_calls
+from verifiers.types import RolloutInput, RolloutOutput
 
 from atroposlib.envs.base import (
     APIServerConfig,
@@ -180,9 +177,11 @@ class VerifiersEnv(BaseEnv):
             info=item.get("info", {}),
         )
 
-    def _states_to_scored_data(self, states: List[State]) -> Optional[ScoredDataGroup]:
+    def _states_to_scored_data(
+        self, states: List[RolloutOutput]
+    ) -> Optional[ScoredDataGroup]:
         """
-        Convert verifiers States to Atropos ScoredDataGroup.
+        Convert verifiers RolloutOutputs to Atropos ScoredDataGroup.
 
         Handles both:
         - vLLM backend: native tokens from trajectory
@@ -203,14 +202,20 @@ class VerifiersEnv(BaseEnv):
             "ref_logprobs": None,
             "generation_params": None,
             "images": None,
-            "distill_token_ids": None,  
+            "distill_token_ids": None,
             "distill_logprobs": None,
         }
 
         for state in states:
             # Skip failed rollouts
             if state.get("error") is not None:
-                logger.warning(f"Skipping failed rollout: {ErrorChain(state['error'])}")
+                error_data = state["error"]
+                error_msg = (
+                    error_data.get("error_chain_str", str(error_data))
+                    if isinstance(error_data, dict)
+                    else str(error_data)
+                )
+                logger.warning(f"Skipping failed rollout: {error_msg}")
                 continue
 
             # Check if vLLM provided native tokens
@@ -262,7 +267,7 @@ class VerifiersEnv(BaseEnv):
         return scored_data
 
     def _stitch_trajectory_tokens(
-        self, state: State
+        self, state: RolloutOutput
     ) -> Tuple[List[int], List[int], List[float]]:
         """
         Stitch tokens from all trajectory steps (vLLM case).
@@ -312,7 +317,7 @@ class VerifiersEnv(BaseEnv):
         return full_ids, full_mask, full_logprobs
 
     def _tokenize_from_messages(
-        self, state: State
+        self, state: RolloutOutput
     ) -> Tuple[List[int], List[int], List[float]]:
         """
         Post-hoc tokenize from message content (OpenAI case).
@@ -398,33 +403,25 @@ class VerifiersEnv(BaseEnv):
         if self.config.eval_temperature is not None:
             sampling_args["temperature"] = self.config.eval_temperature
         else:
-            sampling_args["temperature"] = 1.0  # Default for training
+            sampling_args["temperature"] = 1.0
 
-        # Get model name
         model_name = "default"
         if self.server and self.server.servers:
             model_name = self.server.servers[0].config.model_name
 
         try:
-            # Delegate to verifiers' native run_group
-            gen_sem = asyncio.Semaphore(self.config.group_size)
-            score_sem = asyncio.Semaphore(100)
-
-            states = await self.vf_env.run_group(
+            outputs = await self.vf_env.run_group(
                 group_inputs=rollout_inputs,
                 client=self._vf_client,
                 model=model_name,
-                gen_sampling_args=sampling_args,
-                gen_sem=gen_sem,
-                score_sem=score_sem,
-                score=True,
+                sampling_args=sampling_args,
             )
         except Exception as e:
             logger.error(f"Error during verifiers rollout: {e}")
             return None, []
 
-        # Convert states to ScoredDataGroup
-        scored_data = self._states_to_scored_data(list(states))
+        # Convert RolloutOutputs to ScoredDataGroup
+        scored_data = self._states_to_scored_data(list(outputs))
         return scored_data, []
 
     async def evaluate(self, *args, **kwargs):
@@ -463,22 +460,22 @@ class VerifiersEnv(BaseEnv):
         avg_metrics = results["metadata"]["avg_metrics"]
 
         samples = []
-        for state in results["state"]:
-            clean_prompt = sanitize_tool_calls(
-                messages_to_printable(state.get("prompt"))
-            )
-            clean_completion = sanitize_tool_calls(
-                messages_to_printable(state.get("completion"))
-            )
+        for output in results["outputs"]:
             sample = {
-                "prompt": _to_json_safe(clean_prompt),
-                "completion": _to_json_safe(clean_completion),
-                "reward": state.get("reward"),
-                "answer": state.get("answer"),
-                "stop_condition": state.get("stop_condition"),
+                "prompt": output.get("prompt"),
+                "completion": output.get("completion"),
+                "reward": output.get("reward"),
+                "answer": output.get("answer"),
+                "stop_condition": output.get("stop_condition"),
             }
-            if state.get("error"):
-                sample["error"] = str(ErrorChain(state["error"]))
+
+            if output.get("error"):
+                err = output["error"]
+                sample["error"] = (
+                    err.get("error_chain_str", str(err))
+                    if isinstance(err, dict)
+                    else str(err)
+                )
 
             samples.append(sample)
 

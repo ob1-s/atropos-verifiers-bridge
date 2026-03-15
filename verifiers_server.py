@@ -5,7 +5,6 @@ Enables Verifiers environments to be used for Atropos Evaluation, Data Generatio
 Uses verifiers' native rollout for correct multi-turn support and token capture.
 """
 
-import asyncio
 import json
 import logging
 import random
@@ -19,9 +18,8 @@ import httpx
 import verifiers as vf
 from openai import AsyncOpenAI
 from pydantic import Field, Json
-from verifiers.types import RolloutInput, State
-from verifiers.utils.error_utils import ErrorChain
-from verifiers.utils.message_utils import messages_to_printable, sanitize_tool_calls
+from verifiers.types import RolloutInput, RolloutOutput
+from verifiers.utils.message_utils import concat_messages
 
 from atroposlib.envs.base import (
     APIServerConfig,
@@ -182,7 +180,7 @@ class VerifiersEnv(BaseEnv):
         )
 
     def _build_scored_data(
-        self, states: List[State], tracked_nodes: List[Any]
+        self, states: List[RolloutOutput], tracked_nodes: List[Any]
     ) -> Optional[ScoredDataGroup]:
         """
         Merge verifiers rewards with ManagedServer perfectly aligned tokens.
@@ -219,12 +217,13 @@ class VerifiersEnv(BaseEnv):
             if not completion:
                 continue
 
-            # Verifiers sometimes uses a single dict or a list for completion
-            if isinstance(completion, dict):
-                completion = [completion]
-
-            # Get the exact text the model generated in this rollout
-            final_content = completion[-1].get("content", "")
+            # Safely extract final text content for matching
+            if isinstance(completion, str):
+                final_content = completion
+            elif isinstance(completion, list) and len(completion) > 0:
+                final_content = str(completion[-1].get("content", ""))
+            else:
+                final_content = ""
 
             # Match the verifiers state to the ManagedServer node by content suffix
             matched_node = None
@@ -245,16 +244,20 @@ class VerifiersEnv(BaseEnv):
             # --- Now we can safely merge them! ---
 
             reward = state.get("reward", 0.0)
+
+            # Capture metrics for WandB logging
             self.reward_buffer.append(reward)
 
+            # Verifiers states often contain a breakdown of metrics (e.g. strict accuracy vs partial)
             state_metrics = state.get("metrics", {})
             if state_metrics:
                 for k, v in state_metrics.items():
                     if isinstance(v, (int, float)):
                         self.metrics_buffer[k].append(v)
 
-            prompt = state.get("prompt", [])
-            full_messages = prompt + completion
+            prompt = state.get("prompt") or []
+            # Safely concatenate whether they are strings or lists
+            full_messages = concat_messages([prompt, completion])
 
             # Data from ManagedServer (Perfectly aligned tokens/masks/logprobs)
             scored_data["tokens"].append(matched_node.tokens)
@@ -266,6 +269,7 @@ class VerifiersEnv(BaseEnv):
             scored_data["messages"].append(full_messages)
             scored_data["overrides"].append({})
 
+        # Return None if all rollouts failed
         if not scored_data["tokens"]:
             return None
 
@@ -274,6 +278,15 @@ class VerifiersEnv(BaseEnv):
     async def collect_trajectories(
         self, item: Item
     ) -> Tuple[Optional[ScoredDataGroup], List[Item]]:
+        """
+        Generate and score trajectories using verifiers' native rollout.
+
+        Delegates to vf_env.run_group which handles:
+        - Multi-turn loops
+        - Stop conditions
+        - State tracking
+        - Scoring
+        """
         if self._vf_client is None:
             await self.setup()
 
@@ -282,10 +295,12 @@ class VerifiersEnv(BaseEnv):
             for i in range(self.config.group_size)
         ]
 
+        # Sampling args for generation
         sampling_args = {
             "max_tokens": self.config.max_token_length,
-            "temperature": self.config.eval_temperature or 1.0,
         }
+        if self.config.eval_temperature is not None:
+            sampling_args["temperature"] = self.config.eval_temperature
 
         # 1. Atropos automatically finds the least-busy GPU in the cluster
         async with self.server.managed_server(tokenizer=self.tokenizer) as managed:
@@ -296,14 +311,11 @@ class VerifiersEnv(BaseEnv):
 
             try:
                 # 3. Verifiers runs its multi-turn logic using the adapter
-                states = await self.vf_env.run_group(
+                outputs = await self.vf_env.run_group(
                     group_inputs=rollout_inputs,
                     client=adapter_client,
                     model="default",
-                    gen_sampling_args=sampling_args,
-                    gen_sem=asyncio.Semaphore(self.config.group_size),
-                    score_sem=asyncio.Semaphore(100),
-                    score=True,
+                    sampling_args=sampling_args,
                 )
             except Exception as e:
                 logger.error(f"Error during verifiers rollout: {e}")
@@ -313,8 +325,7 @@ class VerifiersEnv(BaseEnv):
             tracked_nodes = managed.get_state()["nodes"]
 
         # 5. Zip them together.
-        # Grab the 'reward' from the Verifiers state, and the tokens/masks/logprobs from the Atropos node.
-        scored_data = self._build_scored_data(list(states), tracked_nodes)
+        scored_data = self._build_scored_data(list(outputs), tracked_nodes)
 
         return scored_data, []
 
@@ -346,7 +357,7 @@ class VerifiersEnv(BaseEnv):
             sampling_args=sampling_args,
             num_examples=self.config.num_examples,
             rollouts_per_example=self.config.rollouts_per_example,
-            max_concurrent=self.config.max_eval_workers,
+            max_concurrent=getattr(self.config, "max_eval_workers", 32),
         )
 
         end_time = time.time()
@@ -354,22 +365,22 @@ class VerifiersEnv(BaseEnv):
         avg_metrics = results["metadata"]["avg_metrics"]
 
         samples = []
-        for state in results["state"]:
-            clean_prompt = sanitize_tool_calls(
-                messages_to_printable(state.get("prompt"))
-            )
-            clean_completion = sanitize_tool_calls(
-                messages_to_printable(state.get("completion"))
-            )
+        for output in results["outputs"]:
             sample = {
-                "prompt": _to_json_safe(clean_prompt),
-                "completion": _to_json_safe(clean_completion),
-                "reward": state.get("reward"),
-                "answer": state.get("answer"),
-                "stop_condition": state.get("stop_condition"),
+                "prompt": output.get("prompt"),
+                "completion": output.get("completion"),
+                "reward": output.get("reward"),
+                "answer": output.get("answer"),
+                "stop_condition": output.get("stop_condition"),
             }
-            if state.get("error"):
-                sample["error"] = str(ErrorChain(state["error"]))
+
+            if output.get("error"):
+                err = output["error"]
+                sample["error"] = (
+                    err.get("error_chain_str", str(err))
+                    if isinstance(err, dict)
+                    else str(err)
+                )
 
             samples.append(sample)
 

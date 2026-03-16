@@ -2,8 +2,6 @@
 
 The environment works as a bridge between Atropos and the [Verifiers](https://github.com/primeintellect-ai/verifiers) library, as well with the [Environment Hub](https://app.primeintellect.ai/dashboard/environments). It is designed to work out-of-the-box with `atropos` trainers.
 
-This is an alternative verifiers bridge to the one already provided by Atropos. You might want to look at the upstream bridge for more details.
-
 ## Installation
 
 This bridge is designed to be a lightweight plugin for your existing Atropos environment. There are no extra dependencies to install other than having a working `atroposlib` and `verifiers` environment.
